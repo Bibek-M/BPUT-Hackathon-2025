@@ -110,4 +110,4 @@ conversationSchema.methods.generateTitle = function() {
 conversationSchema.index({ userId: 1, createdAt: -1 });
 conversationSchema.index({ userId: 1, isArchived: 1 });
 
-module.exports = mongoose.model('Conversation', conversationSchema);
+module.exports = mongoose.model('Conversation', conversationSchema); 
