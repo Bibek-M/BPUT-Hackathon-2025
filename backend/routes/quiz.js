@@ -1,0 +1,401 @@
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const { Quiz, QuizResult } = require('../models/Quiz');
+const User = require('../models/User');
+const { auth } = require('../middleware/auth');
+const aiService = require('../utils/aiService');
+
+const router = express.Router();
+
+// @route   POST /api/quiz/generate
+// @desc    Generate quiz from text using AI
+// @access  Private
+router.post('/generate', auth, [
+  body('text')
+    .trim()
+    .notEmpty()
+    .withMessage('Text is required')
+    .isLength({ min: 50, max: 50000 })
+    .withMessage('Text must be between 50 and 50000 characters'),
+  body('title')
+    .trim()
+    .notEmpty()
+    .withMessage('Title is required')
+    .isLength({ max: 100 })
+    .withMessage('Title cannot exceed 100 characters'),
+  body('numQuestions')
+    .optional()
+    .isInt({ min: 1, max: 20 })
+    .withMessage('Number of questions must be between 1 and 20'),
+  body('difficulty')
+    .optional()
+    .isIn(['easy', 'medium', 'hard'])
+    .withMessage('Difficulty must be easy, medium, or hard'),
+  body('category')
+    .optional()
+    .trim()
+    .isLength({ max: 50 })
+    .withMessage('Category cannot exceed 50 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation error',
+        details: errors.array()
+      });
+    }
+
+    const { 
+      text, 
+      title, 
+      description = '',
+      numQuestions = 5, 
+      difficulty = 'medium',
+      category = 'General'
+    } = req.body;
+
+    // Generate quiz using AI
+    const questions = await aiService.generateQuiz(text, {
+      numQuestions: parseInt(numQuestions),
+      difficulty,
+      questionTypes: ['multiple-choice']
+    });
+
+    // Create quiz object
+    const quiz = new Quiz({
+      userId: req.user._id,
+      title,
+      description,
+      sourceText: text,
+      questions,
+      difficulty,
+      category
+    });
+
+    await quiz.save();
+
+    // Update user stats
+    await User.findByIdAndUpdate(req.user._id, {
+      $inc: { 'stats.totalQuizzes': 1 }
+    });
+
+    res.status(201).json({
+      message: 'Quiz generated successfully',
+      quiz: {
+        _id: quiz._id,
+        title: quiz.title,
+        description: quiz.description,
+        difficulty: quiz.difficulty,
+        category: quiz.category,
+        questions: quiz.questions,
+        settings: quiz.settings,
+        createdAt: quiz.createdAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Generate quiz error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate quiz',
+      message: error.message 
+    });
+  }
+});
+
+// @route   GET /api/quiz/my-quizzes
+// @desc    Get user's quizzes
+// @access  Private
+router.get('/my-quizzes', auth, async (req, res) => {
+  try {
+    const { page = 1, limit = 10, category, difficulty } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const filter = { userId: req.user._id };
+    if (category && category !== 'all') filter.category = category;
+    if (difficulty && difficulty !== 'all') filter.difficulty = difficulty;
+
+    const quizzes = await Quiz.find(filter)
+      .select('title description difficulty category questions.length createdAt')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    // Add question count
+    const quizzesWithCount = quizzes.map(quiz => ({
+      ...quiz,
+      questionCount: quiz.questions?.length || 0
+    }));
+
+    res.json({
+      quizzes: quizzesWithCount,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: await Quiz.countDocuments(filter)
+      }
+    });
+
+  } catch (error) {
+    console.error('Get my quizzes error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get quizzes',
+      message: error.message 
+    });
+  }
+});
+
+// @route   GET /api/quiz/:id
+// @desc    Get quiz by ID (for taking)
+// @access  Private
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const quiz = await Quiz.findById(req.params.id)
+      .select('title description difficulty category questions settings createdAt userId');
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Check if user has access (own quiz or public quiz)
+    if (!quiz.isPublic && quiz.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Remove correct answers from questions when sending to client (for taking quiz)
+    const questionsForTaking = quiz.questions.map(q => ({
+      question: q.question,
+      options: q.options
+    }));
+
+    res.json({
+      quiz: {
+        _id: quiz._id,
+        title: quiz.title,
+        description: quiz.description,
+        difficulty: quiz.difficulty,
+        category: quiz.category,
+        questions: questionsForTaking,
+        settings: quiz.settings,
+        createdAt: quiz.createdAt,
+        questionCount: quiz.questions.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Get quiz error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get quiz',
+      message: error.message 
+    });
+  }
+});
+
+// @route   POST /api/quiz/:id/submit
+// @desc    Submit quiz answers
+// @access  Private
+router.post('/:id/submit', auth, [
+  body('answers')
+    .isArray({ min: 1 })
+    .withMessage('Answers array is required'),
+  body('answers.*.questionIndex')
+    .isInt({ min: 0 })
+    .withMessage('Question index must be a non-negative integer'),
+  body('answers.*.selectedAnswer')
+    .isInt({ min: 0, max: 3 })
+    .withMessage('Selected answer must be between 0 and 3'),
+  body('timeSpent')
+    .isInt({ min: 0 })
+    .withMessage('Time spent must be a non-negative integer')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        error: 'Validation error',
+        details: errors.array()
+      });
+    }
+
+    const { answers, timeSpent } = req.body;
+    const quizId = req.params.id;
+
+    // Get quiz with correct answers
+    const quiz = await Quiz.findById(quizId);
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Check access
+    if (!quiz.isPublic && quiz.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Calculate score
+    let correctAnswers = 0;
+    const gradedAnswers = answers.map(answer => {
+      const question = quiz.questions[answer.questionIndex];
+      const isCorrect = question && question.correctAnswer === answer.selectedAnswer;
+      if (isCorrect) correctAnswers++;
+
+      return {
+        questionIndex: answer.questionIndex,
+        selectedAnswer: answer.selectedAnswer,
+        isCorrect,
+        timeSpent: answer.timeSpent || 0
+      };
+    });
+
+    const score = Math.round((correctAnswers / quiz.questions.length) * 100);
+
+    // Save quiz result
+    const quizResult = new QuizResult({
+      quizId,
+      userId: req.user._id,
+      answers: gradedAnswers,
+      score,
+      totalQuestions: quiz.questions.length,
+      correctAnswers,
+      timeSpent
+    });
+
+    await quizResult.save();
+
+    // Update user stats
+    const user = await User.findById(req.user._id);
+    const newTotalQuizzes = user.stats.totalQuizzes + 1;
+    const newAverageScore = ((user.stats.averageScore * user.stats.totalQuizzes) + score) / newTotalQuizzes;
+
+    await User.findByIdAndUpdate(req.user._id, {
+      $inc: { 
+        'stats.totalQuizzes': 1,
+        'stats.studyTime': Math.round(timeSpent / 60) // Convert to minutes
+      },
+      $set: {
+        'stats.averageScore': Math.round(newAverageScore)
+      }
+    });
+
+    // Send detailed results
+    const detailedResults = quiz.questions.map((question, index) => {
+      const userAnswer = gradedAnswers.find(a => a.questionIndex === index);
+      return {
+        question: question.question,
+        options: question.options,
+        correctAnswer: question.correctAnswer,
+        selectedAnswer: userAnswer ? userAnswer.selectedAnswer : null,
+        isCorrect: userAnswer ? userAnswer.isCorrect : false,
+        explanation: question.explanation
+      };
+    });
+
+    res.json({
+      message: 'Quiz submitted successfully',
+      result: {
+        _id: quizResult._id,
+        score,
+        correctAnswers,
+        totalQuestions: quiz.questions.length,
+        timeSpent,
+        percentage: score,
+        grade: score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F'
+      },
+      detailedResults: quiz.settings.showCorrectAnswers ? detailedResults : null
+    });
+
+  } catch (error) {
+    console.error('Submit quiz error:', error);
+    res.status(500).json({ 
+      error: 'Failed to submit quiz',
+      message: error.message 
+    });
+  }
+});
+
+// @route   GET /api/quiz/:id/results
+// @desc    Get user's results for a specific quiz
+// @access  Private
+router.get('/:id/results', auth, async (req, res) => {
+  try {
+    const quizId = req.params.id;
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const results = await QuizResult.find({
+      quizId,
+      userId: req.user._id
+    })
+    .sort({ completedAt: -1 })
+    .skip(skip)
+    .limit(parseInt(limit))
+    .populate('quizId', 'title')
+    .lean();
+
+    res.json({
+      results,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: await QuizResult.countDocuments({
+          quizId,
+          userId: req.user._id
+        })
+      }
+    });
+
+  } catch (error) {
+    console.error('Get quiz results error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get quiz results',
+      message: error.message 
+    });
+  }
+});
+
+// @route   DELETE /api/quiz/:id
+// @desc    Delete quiz
+// @access  Private
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const quiz = await Quiz.findOne({
+      _id: req.params.id,
+      userId: req.user._id
+    });
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Delete quiz and associated results
+    await Quiz.findByIdAndDelete(req.params.id);
+    await QuizResult.deleteMany({ quizId: req.params.id });
+
+    res.json({ message: 'Quiz deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete quiz error:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete quiz',
+      message: error.message 
+    });
+  }
+});
+
+// @route   GET /api/quiz/categories
+// @desc    Get available quiz categories
+// @access  Private
+router.get('/categories', auth, async (req, res) => {
+  try {
+    const categories = await Quiz.distinct('category', { userId: req.user._id });
+    res.json({ categories });
+  } catch (error) {
+    console.error('Get categories error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get categories',
+      message: error.message 
+    });
+  }
+});
+
+module.exports = router;
