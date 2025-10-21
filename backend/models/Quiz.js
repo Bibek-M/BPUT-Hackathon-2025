@@ -124,4 +124,4 @@ quizResultSchema.index({ quizId: 1, userId: 1 });
 const Quiz = mongoose.model('Quiz', quizSchema);
 const QuizResult = mongoose.model('QuizResult', quizResultSchema);
 
-module.exports = { Quiz, QuizResult };
+module.exports = { Quiz, QuizResult }``
