@@ -45,6 +45,10 @@ const documentSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  processingError: {
+    type: String,
+    default: null
+  },
   isActive: {
     type: Boolean,
     default: true
