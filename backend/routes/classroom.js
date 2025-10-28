@@ -1,12 +1,10 @@
 const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { auth } = require('../middleware/auth');
+const Room = require('../models/Room');
+const crypto = require('crypto');
 
 const router = express.Router();
-
-// Simple in-memory storage for classroom sessions
-// In production, you'd want to use Redis or a database
-const activeClassrooms = new Map();
 
 // @route   POST /api/classroom/create-room
 // @desc    Create a new classroom room
@@ -22,7 +20,11 @@ router.post('/create-room', auth, [
     .optional()
     .trim()
     .isLength({ max: 500 })
-    .withMessage('Description cannot exceed 500 characters')
+    .withMessage('Description cannot exceed 500 characters'),
+  body('maxParticipants')
+    .optional()
+    .isInt({ min: 2, max: 100 })
+    .withMessage('Max participants must be between 2 and 100')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -33,38 +35,39 @@ router.post('/create-room', auth, [
       });
     }
 
-    const { roomName, description = '', isPrivate = false } = req.body;
+    const { roomName, description = '', isPrivate = false, maxParticipants = 20 } = req.body;
     
-    // Generate unique room ID
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    
-    // Create room object
-    const room = {
-      id: roomId,
+    // Generate invite code for private rooms
+    const inviteCode = isPrivate 
+      ? crypto.randomBytes(4).toString('hex').toUpperCase()
+      : null;
+
+    const room = new Room({
       name: roomName,
       description,
       createdBy: req.user._id,
-      createdByUsername: req.user.username,
-      createdAt: new Date(),
+      maxParticipants,
       isPrivate,
-      participants: [],
-      maxParticipants: 50,
-      isActive: true
-    };
+      isActive: false,
+      participants: [req.user._id],
+      inviteCode
+    });
 
-    // Store room
-    activeClassrooms.set(roomId, room);
+    await room.save();
+    await room.populate('createdBy', 'username profile');
 
     res.status(201).json({
       message: 'Classroom created successfully',
       room: {
-        id: room.id,
+        id: room._id,
         name: room.name,
         description: room.description,
-        createdBy: room.createdByUsername,
+        createdBy: room.createdBy.username,
         createdAt: room.createdAt,
-        participantCount: 0,
-        maxParticipants: room.maxParticipants
+        participantCount: 1,
+        maxParticipants: room.maxParticipants,
+        isPrivate: room.isPrivate,
+        inviteCode: room.inviteCode
       }
     });
 
@@ -82,42 +85,38 @@ router.post('/create-room', auth, [
 // @access  Private
 router.get('/rooms', auth, async (req, res) => {
   try {
-    const { page = 1, limit = 20, search = '' } = req.query;
+    const { search = '' } = req.query;
     
-    // Convert Map to Array and filter
-    const rooms = Array.from(activeClassrooms.values())
-      .filter(room => 
-        room.isActive && 
-        (!room.isPrivate || room.createdBy.toString() === req.user._id.toString()) &&
-        room.name.toLowerCase().includes(search.toLowerCase())
-      )
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const query = {
+      $or: [
+        { isPrivate: false },
+        { createdBy: req.user._id },
+        { participants: req.user._id }
+      ]
+    };
 
-    // Pagination
-    const startIndex = (parseInt(page) - 1) * parseInt(limit);
-    const endIndex = startIndex + parseInt(limit);
-    const paginatedRooms = rooms.slice(startIndex, endIndex);
+    if (search) {
+      query.name = { $regex: search, $options: 'i' };
+    }
 
-    // Format response
-    const roomsWithStats = paginatedRooms.map(room => ({
-      id: room.id,
+    const rooms = await Room.find(query)
+      .populate('createdBy', 'username profile')
+      .sort({ isActive: -1, createdAt: -1 })
+      .lean();
+
+    const roomsWithStats = rooms.map(room => ({
+      id: room._id,
       name: room.name,
       description: room.description,
-      createdBy: room.createdByUsername,
+      createdBy: room.createdBy.username,
       createdAt: room.createdAt,
       participantCount: room.participants.length,
       maxParticipants: room.maxParticipants,
-      isPrivate: room.isPrivate
+      isPrivate: room.isPrivate,
+      isActive: room.isActive
     }));
 
-    res.json({
-      rooms: roomsWithStats,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: rooms.length
-      }
-    });
+    res.json({ rooms: roomsWithStats });
 
   } catch (error) {
     console.error('Get rooms error:', error);
@@ -134,36 +133,39 @@ router.get('/rooms', auth, async (req, res) => {
 router.get('/rooms/:roomId', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const room = activeClassrooms.get(roomId);
+    const room = await Room.findById(roomId)
+      .populate('createdBy', 'username profile')
+      .populate('participants', 'username profile');
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Check if user has access
-    if (room.isPrivate && room.createdBy.toString() !== req.user._id.toString()) {
-      // Check if user is already a participant
-      const isParticipant = room.participants.some(p => p.userId === req.user._id.toString());
-      if (!isParticipant) {
+    // Check if user has access to private room
+    if (room.isPrivate) {
+      const hasAccess = room.createdBy._id.toString() === req.user._id.toString() ||
+                       room.participants.some(p => p._id.toString() === req.user._id.toString());
+      if (!hasAccess) {
         return res.status(403).json({ error: 'Access denied to private room' });
       }
     }
 
     const roomDetails = {
-      id: room.id,
+      id: room._id,
       name: room.name,
       description: room.description,
-      createdBy: room.createdByUsername,
+      createdBy: room.createdBy.username,
       createdAt: room.createdAt,
       participants: room.participants.map(p => ({
-        userId: p.userId,
+        userId: p._id,
         username: p.username,
-        joinedAt: p.joinedAt
+        profile: p.profile
       })),
       participantCount: room.participants.length,
       maxParticipants: room.maxParticipants,
       isPrivate: room.isPrivate,
-      isActive: room.isActive
+      isActive: room.isActive,
+      inviteCode: room.isPrivate ? room.inviteCode : null
     };
 
     res.json({ room: roomDetails });
@@ -183,14 +185,16 @@ router.get('/rooms/:roomId', auth, async (req, res) => {
 router.post('/rooms/:roomId/join', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const room = activeClassrooms.get(roomId);
+    const { inviteCode } = req.body;
 
+    const room = await Room.findById(roomId);
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    if (!room.isActive) {
-      return res.status(400).json({ error: 'Room is no longer active' });
+    // Verify invite code for private rooms
+    if (room.isPrivate && room.inviteCode !== inviteCode) {
+      return res.status(403).json({ error: 'Invalid invite code' });
     }
 
     // Check if room is full
@@ -199,31 +203,24 @@ router.post('/rooms/:roomId/join', auth, async (req, res) => {
     }
 
     // Check if user is already in the room
-    const existingParticipant = room.participants.find(p => p.userId === req.user._id.toString());
-    if (existingParticipant) {
+    if (room.participants.includes(req.user._id)) {
       return res.json({ 
         message: 'Already in room',
         room: {
-          id: room.id,
+          id: room._id,
           name: room.name
         }
       });
     }
 
     // Add user to participants
-    room.participants.push({
-      userId: req.user._id.toString(),
-      username: req.user.username,
-      joinedAt: new Date()
-    });
-
-    // Update room
-    activeClassrooms.set(roomId, room);
+    room.participants.push(req.user._id);
+    await room.save();
 
     res.json({
       message: 'Joined room successfully',
       room: {
-        id: room.id,
+        id: room._id,
         name: room.name,
         participantCount: room.participants.length
       }
@@ -244,22 +241,23 @@ router.post('/rooms/:roomId/join', auth, async (req, res) => {
 router.post('/rooms/:roomId/leave', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const room = activeClassrooms.get(roomId);
+    const room = await Room.findById(roomId);
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
     // Remove user from participants
-    room.participants = room.participants.filter(p => p.userId !== req.user._id.toString());
+    room.participants = room.participants.filter(
+      p => p.toString() !== req.user._id.toString()
+    );
 
-    // If room is empty and creator left, mark as inactive
-    if (room.participants.length === 0 && room.createdBy.toString() === req.user._id.toString()) {
+    // If creator leaves or room is empty, deactivate
+    if (room.createdBy.toString() === req.user._id.toString() || room.participants.length === 0) {
       room.isActive = false;
     }
 
-    // Update room
-    activeClassrooms.set(roomId, room);
+    await room.save();
 
     res.json({ message: 'Left room successfully' });
 
@@ -278,7 +276,7 @@ router.post('/rooms/:roomId/leave', auth, async (req, res) => {
 router.delete('/rooms/:roomId', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const room = activeClassrooms.get(roomId);
+    const room = await Room.findById(roomId);
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
@@ -289,8 +287,7 @@ router.delete('/rooms/:roomId', auth, async (req, res) => {
       return res.status(403).json({ error: 'Only room creator can delete the room' });
     }
 
-    // Remove room
-    activeClassrooms.delete(roomId);
+    await Room.findByIdAndDelete(roomId);
 
     res.json({ message: 'Room deleted successfully' });
 
@@ -308,21 +305,22 @@ router.delete('/rooms/:roomId', auth, async (req, res) => {
 // @access  Private
 router.get('/my-rooms', auth, async (req, res) => {
   try {
-    const myRooms = Array.from(activeClassrooms.values())
-      .filter(room => room.createdBy.toString() === req.user._id.toString())
-      .map(room => ({
-        id: room.id,
-        name: room.name,
-        description: room.description,
-        createdAt: room.createdAt,
-        participantCount: room.participants.length,
-        maxParticipants: room.maxParticipants,
-        isPrivate: room.isPrivate,
-        isActive: room.isActive
-      }))
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const myRooms = await Room.find({ createdBy: req.user._id })
+      .sort({ createdAt: -1 })
+      .lean();
 
-    res.json({ rooms: myRooms });
+    const roomsFormatted = myRooms.map(room => ({
+      id: room._id,
+      name: room.name,
+      description: room.description,
+      createdAt: room.createdAt,
+      participantCount: room.participants.length,
+      maxParticipants: room.maxParticipants,
+      isPrivate: room.isPrivate,
+      isActive: room.isActive
+    }));
+
+    res.json({ rooms: roomsFormatted });
 
   } catch (error) {
     console.error('Get my rooms error:', error);
@@ -349,8 +347,8 @@ router.put('/rooms/:roomId', auth, [
     .withMessage('Description cannot exceed 500 characters'),
   body('maxParticipants')
     .optional()
-    .isInt({ min: 1, max: 100 })
-    .withMessage('Max participants must be between 1 and 100')
+    .isInt({ min: 2, max: 100 })
+    .withMessage('Max participants must be between 2 and 100')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -362,7 +360,7 @@ router.put('/rooms/:roomId', auth, [
     }
 
     const { roomId } = req.params;
-    const room = activeClassrooms.get(roomId);
+    const room = await Room.findById(roomId);
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
@@ -377,17 +375,13 @@ router.put('/rooms/:roomId', auth, [
     if (req.body.name) room.name = req.body.name;
     if (req.body.description !== undefined) room.description = req.body.description;
     if (req.body.maxParticipants) room.maxParticipants = req.body.maxParticipants;
-    if (req.body.isPrivate !== undefined) room.isPrivate = req.body.isPrivate;
 
-    room.updatedAt = new Date();
-
-    // Update room
-    activeClassrooms.set(roomId, room);
+    await room.save();
 
     res.json({
       message: 'Room updated successfully',
       room: {
-        id: room.id,
+        id: room._id,
         name: room.name,
         description: room.description,
         maxParticipants: room.maxParticipants,
@@ -404,23 +398,42 @@ router.put('/rooms/:roomId', auth, [
   }
 });
 
-// Helper function to clean up inactive rooms (called periodically)
-const cleanupInactiveRooms = () => {
-  const now = new Date();
-  const maxInactiveTime = 24 * 60 * 60 * 1000; // 24 hours
+// @route   PUT /api/classroom/rooms/:roomId/activate
+// @desc    Activate/deactivate room (creator only)
+// @access  Private
+router.put('/rooms/:roomId/activate', auth, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { isActive } = req.body;
 
-  for (const [roomId, room] of activeClassrooms.entries()) {
-    const timeSinceCreated = now - room.createdAt;
-    const hasParticipants = room.participants.length > 0;
-
-    // Remove rooms that are inactive for more than 24 hours and have no participants
-    if (!hasParticipants && (timeSinceCreated > maxInactiveTime || !room.isActive)) {
-      activeClassrooms.delete(roomId);
+    const room = await Room.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
     }
-  }
-};
 
-// Run cleanup every hour
-setInterval(cleanupInactiveRooms, 60 * 60 * 1000);
+    if (room.createdBy.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Only room creator can activate/deactivate the room' });
+    }
+
+    room.isActive = isActive;
+    await room.save();
+
+    res.json({
+      message: `Room ${isActive ? 'activated' : 'deactivated'} successfully`,
+      room: {
+        id: room._id,
+        name: room.name,
+        isActive: room.isActive
+      }
+    });
+
+  } catch (error) {
+    console.error('Activate room error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update room status',
+      message: error.message 
+    });
+  }
+});
 
 module.exports = router;

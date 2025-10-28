@@ -86,24 +86,90 @@ router.post('/ask/:courseId',
         return res.status(403).json({ error: 'Access denied to this course' });
       }
 
-      // Generate embedding for the question
-      let questionEmbedding;
+      // Try to generate embedding for the question
+      let questionEmbedding = null;
+      let useHybridMode = false;
+      
       try {
         const embeddingResponse = await aiService.generateEmbedding(question);
-        questionEmbedding = { data: [{ embedding: embeddingResponse.embedding }] };
+        if (embeddingResponse === null) {
+          // Hybrid mode signal
+          useHybridMode = true;
+          console.log('🔄 Using hybrid RAG mode (no embeddings)');
+        } else {
+          questionEmbedding = { data: [{ embedding: embeddingResponse.embedding }] };
+        }
       } catch (error) {
         console.error('Embedding generation error:', error);
-        return res.status(503).json({
-          error: 'Failed to process your question. Please try again later.',
-          message: error.message
-        });
+        const isQuotaError = error.message.includes('quota') || error.message.includes('429') || error.message.includes('RESOURCE_EXHAUSTED');
+        
+        if (isQuotaError) {
+          // Try hybrid mode as fallback
+          useHybridMode = true;
+          console.log('⚠️ Embedding quota exceeded, switching to hybrid RAG mode');
+        } else {
+          return res.status(503).json({
+            error: 'Failed to process your question. Please try again later.',
+            message: error.message
+          });
+        }
       }
 
-      // Find relevant chunks
-      const relevantChunks = await findRelevantChunks(
-        courseId, 
-        questionEmbedding.data[0].embedding
-      );
+      // Find relevant chunks (using embeddings or hybrid mode)
+      let relevantChunks;
+      
+      if (useHybridMode) {
+        // Get all document chunks for hybrid matching
+        const documents = await Document.find({
+          course: courseId,
+          isActive: true
+        }).select('content title');
+        
+        if (documents.length === 0) {
+          return res.json({
+            answer: "No documents have been uploaded to this course yet.",
+            sources: [],
+            confidence: 0,
+            mode: 'hybrid'
+          });
+        }
+        
+        // Extract chunks from documents
+        const allChunks = [];
+        documents.forEach(doc => {
+          const content = doc.content || '';
+          // Simple chunking
+          const chunks = content.match(/.{1,1000}/g) || [];
+          chunks.forEach(chunk => {
+            allChunks.push({
+              chunk: chunk.trim(),
+              documentTitle: doc.title,
+              documentId: doc._id
+            });
+          });
+        });
+        
+        // Use LLM to find relevant chunks
+        try {
+          const llmResults = await aiService.findRelevantChunksWithLLM(question, allChunks.map(c => c.chunk), 5);
+          relevantChunks = llmResults.map(result => ({
+            chunk: result.chunk,
+            similarity: result.similarity,
+            documentTitle: allChunks[result.index]?.documentTitle || 'Unknown',
+            documentId: allChunks[result.index]?.documentId
+          }));
+        } catch (error) {
+          console.error('Hybrid RAG failed:', error);
+          // Use first 5 chunks as fallback
+          relevantChunks = allChunks.slice(0, 5).map(c => ({ ...c, similarity: 0.5 }));
+        }
+      } else {
+        // Traditional embedding-based search
+        relevantChunks = await findRelevantChunks(
+          courseId, 
+          questionEmbedding.data[0].embedding
+        );
+      }
 
       if (relevantChunks.length === 0) {
         return res.json({
@@ -161,7 +227,8 @@ ${context}`;
         answer,
         sources,
         confidence,
-        question
+        question,
+        mode: useHybridMode ? 'hybrid' : 'embedding'
       });
 
     } catch (error) {

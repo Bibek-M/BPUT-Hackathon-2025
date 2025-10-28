@@ -86,8 +86,9 @@ router.post('/conversations', auth, [
       title: title || 'New Conversation',
       context: context || '',
       settings: {
-        aiProvider: req.user.preferences.aiProvider,
-        model: req.user.preferences.aiProvider === 'openai' ? 'gpt-3.5-turbo' : 'gemini-pro'
+        aiProvider: req.user.preferences?.aiProvider || 'gemini',
+        model: req.user.preferences?.aiProvider === 'openai' ? 'gpt-3.5-turbo' : 
+               req.user.preferences?.aiProvider === 'groq' ? 'llama-3.3-70b-versatile' : 'gemini-pro'
       }
     });
 
@@ -437,7 +438,8 @@ router.post('/sessions', auth, async (req, res) => {
       title: title || 'New Chat Session',
       settings: {
         aiProvider: req.user.preferences?.aiProvider || 'gemini',
-        model: req.user.preferences?.aiProvider === 'openai' ? 'gpt-3.5-turbo' : 'gemini-pro'
+        model: req.user.preferences?.aiProvider === 'openai' ? 'gpt-3.5-turbo' : 
+               req.user.preferences?.aiProvider === 'groq' ? 'llama-3.3-70b-versatile' : 'gemini-pro'
       }
     });
 
